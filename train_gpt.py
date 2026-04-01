@@ -451,7 +451,7 @@ def _hadamard(x: Tensor) -> tuple[Tensor, int]:
     while h < n:
         x = x.reshape(*x.shape[:-1], n // (2 * h), 2, h)
         a, b = x[..., 0, :], x[..., 1, :]
-        x = torch.cat([a + b, a - b], dim=-2).reshape(*x.shape[:-3], n)
+        x = torch.stack([a + b, a - b], dim=-2).reshape(*x.shape[:-3], n)
         h *= 2
     return x / math.sqrt(n), n
 
