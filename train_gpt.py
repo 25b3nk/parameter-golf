@@ -430,7 +430,130 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# HADAMARD INT4 QUANTIZATION
+# -----------------------------
+# Walsh-Hadamard rotation before quantization suppresses outliers (TurboQuant / QuIP#),
+# enabling int4 quality comparable to int8 — halving payload before zlib.
+# Toggle: QUANTIZATION_SCHEME=int4_hadamard  (default: int8)
+
+QUANTIZATION_SCHEME = os.environ.get("QUANTIZATION_SCHEME", "int8")
+_INT4_MAX, _INT4_SCALE_DTYPE = 7, torch.float16
+
+
+def _hadamard(x: Tensor) -> tuple[Tensor, int]:
+    """Normalized Walsh-Hadamard transform on last dim. Pads to next power of 2."""
+    n_orig = x.shape[-1]
+    n = 1 << (n_orig - 1).bit_length() if n_orig >= 1 else 1
+    if n != n_orig:
+        x = F.pad(x, (0, n - n_orig))
+    x = x.float()
+    h = 1
+    while h < n:
+        x = x.reshape(*x.shape[:-1], n // (2 * h), 2, h)
+        a, b = x[..., 0, :], x[..., 1, :]
+        x = torch.cat([a + b, a - b], dim=-2).reshape(*x.shape[:-3], n)
+        h *= 2
+    return x / math.sqrt(n), n
+
+
+def _pack_int4(q: Tensor) -> Tensor:
+    """Pack int8 values in [-7, 7] into nibbles (two per byte, uint8 storage)."""
+    if q.shape[-1] % 2 != 0:
+        q = F.pad(q, (0, 1))
+    u = (q.to(torch.int32) + 8).clamp(0, 15).to(torch.uint8)
+    return u[..., 0::2] | (u[..., 1::2] << 4)
+
+
+def _unpack_int4(packed: Tensor, n: int) -> Tensor:
+    """Unpack nibbles back to int8 tensor of length n."""
+    lo = (packed & 0xF).to(torch.int32) - 8
+    hi = ((packed >> 4) & 0xF).to(torch.int32) - 8
+    return torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1)[..., :n].to(torch.int8)
+
+
+def quantize_state_dict_int4_hadamard(state_dict: dict[str, Tensor]):
+    """Quantize state dict using Hadamard rotation + int4 for large 2D matrices."""
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    meta: dict[str, list] = {}  # [n_orig_cols, n_padded_cols] for Hadamard; [] for int8 fallback
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors",
+         "baseline_tensor_bytes", "int8_payload_bytes"), 0,
+    )
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        stats["num_float_tensors"] += 1
+        if t.ndim == 2:
+            t_h, n_padded = _hadamard(t)
+            clip_abs = torch.quantile(t_h.abs(), INT8_CLIP_Q, dim=1)
+            scale = (clip_abs / _INT4_MAX).clamp_min(1.0 / _INT4_MAX)
+            q = torch.clamp(torch.round(
+                torch.clamp(t_h, -clip_abs[:, None], clip_abs[:, None]) / scale[:, None]
+            ), -_INT4_MAX, _INT4_MAX).to(torch.int8)
+            packed = _pack_int4(q)
+            quantized[name] = packed
+            scales[name] = scale.to(_INT4_SCALE_DTYPE)
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            meta[name] = [t.shape[1], n_padded]
+            stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(scale)
+        else:
+            q, s = quantize_float_tensor(t)
+            quantized[name] = q
+            scales[name] = s
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            meta[name] = []
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+    obj: dict[str, object] = {
+        "__quant_format__": "int4_hadamard_v1",
+        "quantized": quantized, "scales": scales,
+        "dtypes": dtypes, "meta": meta, "passthrough": passthrough,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int4_hadamard(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, packed in obj["quantized"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s, m = obj["scales"][name], obj["meta"][name]
+        if m:  # Hadamard int4
+            n_orig, n_padded = m
+            t_rec, _ = _hadamard(_unpack_int4(packed, n_padded).float() * s.to(torch.float32)[:, None])
+            out[name] = t_rec[..., :n_orig].to(dtype).contiguous()
+        else:  # int8 fallback (1D)
+            s32 = s.to(torch.float32)
+            scale = float(s32.item()) if s32.ndim == 0 else s32.view(packed.shape[0], *([1] * (packed.ndim - 1)))
+            out[name] = (packed.float() * scale).to(dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig = passthrough_orig_dtypes.get(name)
+        if isinstance(orig, str):
+            out_t = out_t.to(dtype=getattr(torch, orig)).contiguous()
+        out[name] = out_t
+    return out
+
+
+# -----------------------------
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -1305,7 +1428,9 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    _quant_fn = quantize_state_dict_int4_hadamard if QUANTIZATION_SCHEME == "int4_hadamard" else quantize_state_dict_int8
+    _dequant_fn = dequantize_state_dict_int4_hadamard if QUANTIZATION_SCHEME == "int4_hadamard" else dequantize_state_dict_int8
+    quant_obj, quant_stats = _quant_fn(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1317,6 +1442,7 @@ def main() -> None:
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log0(f"quant_scheme:{QUANTIZATION_SCHEME}")
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
@@ -1328,7 +1454,7 @@ def main() -> None:
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.load_state_dict(_dequant_fn(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
