@@ -437,6 +437,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 # Toggle: QUANTIZATION_SCHEME=int4_hadamard  (default: int8)
 
 QUANTIZATION_SCHEME = os.environ.get("QUANTIZATION_SCHEME", "int8")
+USE_RESFORMER = bool(int(os.environ.get("USE_RESFORMER", "0")))
 _INT4_MAX, _INT4_SCALE_DTYPE = 7, torch.float16
 
 
@@ -824,6 +825,13 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # ResFormer value embeddings: alternating layers get a direct token→value shortcut.
+        # At vocab=1024, each table costs only 1024*kv_dim params but gives a significant BPB boost.
+        kv_dim = num_kv_heads * (model_dim // num_heads)
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(vocab_size, kv_dim)
+            for i in range(num_layers) if USE_RESFORMER and i % 2 == (num_layers - 1) % 2
+        })
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -839,10 +847,14 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
+        def _ve_fn(idx):
+            ve = self.value_embeds[str(idx)](input_ids).to(x.dtype)
+            return (lambda n, ve=ve: ve)
+
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
-            vd = lora.v_loras[i] if lora else None
+            vd = lora.v_loras[i] if lora else _ve_fn(i) if str(i) in self.value_embeds else None
             x = self.blocks[i](x, x0, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -850,7 +862,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
-            vd = lora.v_loras[bi] if lora else None
+            vd = lora.v_loras[bi] if lora else _ve_fn(bi) if str(bi) in self.value_embeds else None
             x = self.blocks[bi](x, x0, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1238,6 +1250,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.value_embeds:
+        ve_params = list(base_model.value_embeds.parameters())
+        ve_lr = args.tied_embed_lr * 0.5
+        optimizer_ve = torch.optim.Adam(
+            [{"params": ve_params, "lr": ve_lr, "base_lr": ve_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+        )
+        optimizers.append(optimizer_ve)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
